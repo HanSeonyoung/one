@@ -1,0 +1,71 @@
+name: ci
+
+# 푸시마다 돈다. sync.yml 과 나눈 이유:
+#   - sync 는 시크릿(사람인 키·서비스 계정)이 있어야 의미가 있고 하루 한 번 돈다
+#   - ci 는 시크릿이 하나도 필요 없다 — 사람인 승인을 기다리는 동안에도 초록불이 뜬다
+# 한 파일에 몰아두면 푸시해도 Actions 탭이 비어 있어서 "Actions 가 막혔나" 로 보인다.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 은 pyproject 의 requires-python 하한, 3.12 는 Dockerfile 과 같은 버전.
+        # 로컬(WSL2)과 CI 의 파이썬이 달라서 생기는 차이를 여기서 먼저 본다.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 설치 (editable 아님 — 설치물을 검사한다)
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[dev]'
+
+      - name: 패키징 스모크 (레포 밖에서)
+        # cwd 가 sys.path 에 들어가 소스 트리를 집어주는 우연한 성공을 배제한다.
+        run: |
+          cd /tmp
+          python -c "import jobcal.cli, jobcal.sources.base, jobcal.vendor.crawler_utils; print('import OK')"
+          python -m jobcal --help > /dev/null
+
+      - name: 테스트
+        run: python -m pytest -q
+
+      - name: 설정 파일 검증
+        run: |
+          python - <<'PY'
+          import yaml
+          from pathlib import Path
+          for path in ["config/companies.yml", ".github/workflows/ci.yml", ".github/workflows/sync.yml"]:
+              yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+              print(f"{path} OK")
+          PY
+
+  docker:
+    # 이미지 빌드 안에 import 검증이 들어 있어, 패키징이 깨지면 여기서 멈춘다.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: 이미지 빌드
+        run: docker build -t jobcal-sync:ci .
+      - name: dry-run 기동 확인
+        # 자격증명이 없으므로 설정 로드 단계에서 멈추는 게 정상이다.
+        # 확인하려는 것은 'import 가 되고 CLI 가 뜨는가' 다.
+        run: docker run --rm jobcal-sync:ci --help

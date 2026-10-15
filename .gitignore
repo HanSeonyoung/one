@@ -1,0 +1,18 @@
+# 수집 결과물 — 제3자 콘텐츠가 섞일 수 있으므로 통째로 막는다
+output/
+*.csv
+
+# 자격증명 — last-match-wins 로 한 번 더 막는다
+.env
+*service-account*.json
+**/*secret*
+**/*token*.json
+**/cookies*.json
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/

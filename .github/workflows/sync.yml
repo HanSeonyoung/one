@@ -1,0 +1,131 @@
+name: sync
+
+# ⚠ schedule 은 '기본 브랜치에 있는 워크플로' 만 발동한다. 기능 브랜치에 두면
+#   영원히 안 돈다. 그리고 이 파일에는 push 트리거가 없다 — 푸시 때 도는 테스트는
+#   ci.yml 쪽이다. 지금 바로 한 번 돌려 보려면 Actions 탭에서 'Run workflow'
+#   (workflow_dispatch) 를 누르면 되고, 그 버튼도 기본 브랜치에 있어야 보인다.
+on:
+  schedule:
+    # 매일 08:17 KST. timezone 키를 쓰면 UTC 환산을 손으로 하지 않아도 되고,
+    # 서머타임이 있는 지역으로 옮겨도 식이 그대로 통한다(한국은 DST 가 없지만,
+    # 코드를 읽는 사람이 '23:17 UTC 가 왜 아침인가' 를 되짚을 필요가 없어진다).
+    #
+    # 분을 :00 에 두지 않은 이유: 공식 문서가 매시 정각에 부하가 몰려 실행이
+    # 밀리고, 부하가 심하면 큐에 든 작업이 버려질 수 있다고 적어 두었다.
+    # 그래서 '분을 옮기라' 는 것이 문서의 권고사항이다.
+    #
+    # 참고: public 레포에서는 60일간 활동이 없으면 schedule 이 자동 비활성화된다.
+    - cron: "17 8 * * *"
+      timezone: "Asia/Seoul"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "계획만 보고 캘린더는 건드리지 않음"
+        type: boolean
+        default: true
+      force:
+        description: "대량삭제 가드 무시 (확인 후에만)"
+        type: boolean
+        default: false
+
+# 실행이 겹치면 같은 캘린더에 동시에 쓰게 된다. event id 가 결정적이라 치명적이진
+# 않지만(409 → patch 로 흡수), 로그가 섞이고 호출을 두 배로 쓴다.
+concurrency:
+  group: jobcal-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 잡 수준에 둬야 아래 step 의 if 조건에서 env.* 로 읽힌다.
+    # step 자신의 env 는 그 step 의 if 에서 보이지 않고, secrets 컨텍스트도
+    # step if 에서는 쓸 수 없다 — 이 배치가 '시크릿 없으면 알림 생략' 의 유일한 방법이다.
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 의존성 설치
+        # 일부러 editable(-e) 이 아니다. editable 은 소스 트리를 그대로 쓰기 때문에
+        # '설치했을 때 import 되는가' 를 검사하지 못한다. 벤더 모듈이 설치물에서
+        # 빠지는 버그를 editable 테스트가 전부 통과한 채로 놓친 적이 있다.
+        # 여기서는 Docker·Codespaces 와 같은 방식으로 설치해 같은 것을 검사한다.
+        #
+        # 코어만 설치한다. scrapling[fetchers] 는 playwright·patchright·Chromium 을
+        # 끌고 오는데(수백 MB, 수 분), 사람인·원티드는 평문 JSON 이라 필요가 없다.
+        # 브라우저 렌더링이 필요한 소스를 붙일 때만 '.[crawl]' 로 바꾼다.
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[dev]'
+
+      - name: 패키징 스모크
+        # 레포 밖에서 돌린다 — cwd 가 sys.path 에 들어가 소스 트리를 집어주는
+        # 우연한 성공을 배제하기 위해서다. 설치물만으로 import 가 돼야 통과한다.
+        run: |
+          cd /tmp
+          python -c "import jobcal.cli, jobcal.sources.base, jobcal.vendor.crawler_utils; print('import OK')"
+          python -m jobcal --help > /dev/null
+
+      - name: 테스트
+        # 동기화 전에 돌린다. 멱등성과 대량삭제 가드가 깨진 코드를 캘린더에
+        # 들이대는 것보다, 그날 동기화를 한 번 건너뛰는 쪽이 훨씬 싸다.
+        run: python -m pytest -q
+
+      - name: 시크릿 확인
+        # 없는 시크릿은 ValueError 트레이스로 터지는데, 무인 실행에서 그건 읽기 어렵다.
+        # 무엇이 비었는지 이름으로 먼저 알린다.
+        env:
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SARAMIN_ACCESS_KEY: ${{ secrets.SARAMIN_ACCESS_KEY }}
+        run: |
+          missing=""
+          for name in GOOGLE_CALENDAR_ID GOOGLE_SERVICE_ACCOUNT_JSON SARAMIN_ACCESS_KEY; do
+            if [ -z "$(printenv "$name")" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::설정되지 않은 Secret:$missing"
+            echo "Settings > Secrets and variables > Actions 에서 추가하세요." >&2
+            exit 1
+          fi
+          echo "시크릿 3개 확인됨"
+
+      - name: 동기화
+        env:
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SARAMIN_ACCESS_KEY: ${{ secrets.SARAMIN_ACCESS_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ "${{ inputs.force }}" = "true" ]; then ARGS="$ARGS --force"; fi
+          python -m jobcal $ARGS
+
+      - name: 수집 결과 업로드
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postings-${{ github.run_number }}
+          path: output/postings.csv
+          # 제3자 콘텐츠다 — 레포에 커밋하지 않고, 아티팩트도 짧게만 둔다
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 실패 알림
+        # 무인 실행이라 조용한 실패가 가장 위험하다. 검증 실패(2)나 대량삭제
+        # 차단(3)은 '사람이 봐야 하는 상태' 이므로 반드시 밖으로 알린다.
+        # SLACK_WEBHOOK_URL 이 없으면 이 단계는 그냥 건너뛴다.
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(printf '{"text":"jobcal-sync 실패 — %s"}' "$RUN_URL")
+          curl -sS -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$payload"
